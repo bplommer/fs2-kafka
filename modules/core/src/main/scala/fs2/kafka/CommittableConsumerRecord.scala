@@ -6,6 +6,7 @@
 
 package fs2.kafka
 
+import cats.effect.Temporal
 import cats.syntax.bifoldable._
 import cats.syntax.bitraverse._
 import cats.syntax.foldable._
@@ -14,6 +15,9 @@ import cats.syntax.show._
 import cats.syntax.eq._
 import cats.syntax.traverse._
 import cats.{Applicative, Bitraverse, Eq, Eval, Show, Traverse}
+import fs2.Stream
+
+import scala.concurrent.duration.FiniteDuration
 
 /**
   * [[CommittableConsumerRecord]] is a Kafka record along with an
@@ -131,4 +135,11 @@ object CommittableConsumerRecord {
       )(f: (A, Eval[B]) => Eval[B]): Eval[B] =
         fa.record.foldRight(lb)(f)
     }
+
+  implicit final class StreamOps[F[_]](
+    private val self: Stream[F, CommittableConsumerRecord[F, _, _]]
+  ) {
+    def commitBatchWithin(n: Int, d: FiniteDuration)(implicit F: Temporal[F]): Stream[F, Unit] =
+      self.map(_.offset).through(fs2.kafka.commitBatchWithin(n, d))
+  }
 }

@@ -80,86 +80,38 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
     topics: NonEmptyList[String],
     callback: Either[Throwable, Unit] => F[Unit]
   ): F[Unit] = {
-    val subscribe =
-      withConsumer.blocking {
-        _.subscribe(
-          topics.toList.asJava,
-          consumerRebalanceListener
-        )
-      }.attempt
-
-    subscribe
-      .flatTap {
-        case Left(_) => F.unit
-        case Right(_) =>
-          ref
-            .updateAndGet(_.asSubscribed)
-            .log(SubscribedTopics(topics, _))
-      }
-      .flatMap(callback)
-  }
+    withConsumer.blocking { _.subscribe(topics.toList.asJava, consumerRebalanceListener) } >>
+      ref.updateAndGet(_.asSubscribed).log(SubscribedTopics(topics, _))
+  }.attempt.flatMap(callback)
 
   private[this] def subscribe(
     pattern: Pattern,
     callback: Either[Throwable, Unit] => F[Unit]
   ): F[Unit] = {
-    val subscribe =
-      withConsumer.blocking {
-        _.subscribe(
-          pattern,
-          consumerRebalanceListener
-        )
-      }.attempt
+    withConsumer.blocking { _.subscribe(pattern, consumerRebalanceListener) } >>
+      ref.updateAndGet(_.asSubscribed).log(SubscribedPattern(pattern, _))
+  }.attempt.flatMap(callback)
 
-    subscribe
-      .flatTap {
-        case Left(_) => F.unit
-        case Right(_) =>
-          ref
-            .updateAndGet(_.asSubscribed)
-            .log(SubscribedPattern(pattern, _))
-      }
-      .flatMap(callback)
-  }
-
-  private[this] def unsubscribe(
-    callback: Either[Throwable, Unit] => F[Unit]
-  ): F[Unit] = {
-    val unsubscribe =
-      withConsumer.blocking { _.unsubscribe() }.attempt
-
-    unsubscribe
-      .flatTap {
-        case Left(_) => F.unit
-        case Right(_) =>
-          ref
-            .updateAndGet(_.asUnsubscribed)
-            .log(Unsubscribed(_))
-      }
-      .flatMap(callback)
-  }
+  private[this] def unsubscribe(callback: Either[Throwable, Unit] => F[Unit]): F[Unit] = {
+    withConsumer.blocking { _.unsubscribe() } >>
+      ref.updateAndGet(_.asUnsubscribed).log(Unsubscribed(_))
+  }.attempt.flatMap(callback)
 
   private[this] def assign(
     partitions: NonEmptySet[TopicPartition],
     callback: Either[Throwable, Unit] => F[Unit]
   ): F[Unit] = {
-    val assign =
-      withConsumer.blocking {
+    withConsumer
+      .blocking {
         _.assign(
           partitions.toList.asJava
         )
-      }.attempt
-
-    assign
-      .flatTap {
-        case Left(_) => F.unit
-        case Right(_) =>
-          ref
-            .updateAndGet(_.asSubscribed)
-            .log(ManuallyAssignedPartitions(partitions, _))
-      }
-      .flatMap(callback)
-  }
+      } >>
+      ref
+        .updateAndGet(_.asSubscribed)
+        .log(ManuallyAssignedPartitions(partitions, _))
+  }.attempt
+    .flatMap(callback)
 
   private[this] def fetch(
     partition: TopicPartition,
@@ -170,20 +122,15 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
       withConsumer.blocking { _.assignment.contains(partition) }
 
     def storeFetch =
-      ref
-        .modify { state =>
-          val (newState, oldFetch) =
-            state.withFetch(partition, streamId, callback)
-          (newState, (newState, oldFetch))
+      ref.modify { state =>
+        val (newState, oldFetches) = state.withFetch(partition, streamId, callback)
+        newState -> {
+          log(StoredFetch(partition, callback, newState)) >>
+            oldFetches.traverse_ { fetch =>
+              fetch.completeRevoked(Chunk.empty) >> log(RevokedPreviousFetch(partition, streamId))
+            }
         }
-        .flatMap {
-          case (newState, oldFetches) =>
-            log(StoredFetch(partition, callback, newState)) >>
-              oldFetches.traverse_ { fetch =>
-                fetch.completeRevoked(Chunk.empty) >>
-                  log(RevokedPreviousFetch(partition, streamId))
-              }
-        }
+      }.flatten
 
     def completeRevoked =
       callback((Chunk.empty, FetchCompletedReason.TopicPartitionRevoked))
@@ -205,22 +152,15 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
       .handleErrorWith(e => F.delay(callback(Left(e))))
 
   private[this] def commit(request: Request.Commit[F]): F[Unit] =
-    ref
-      .modify { state =>
-        if (state.rebalancing) {
-          val newState = state.withPendingCommit(request)
-          (newState, Some(StoredPendingCommit(request, newState)))
-        } else (state, None)
-      }
-      .flatMap {
-        case Some(log) => logging.log(log)
-        case None      => commitAsync(request.offsets, request.callback)
-      }
+    ref.modify { state =>
+      if (state.rebalancing) {
+        state.withPendingCommit(request) ->
+          logging.log(StoredPendingCommit(request, state.withPendingCommit(request)))
+      } else state -> commitAsync(request.offsets, request.callback)
+    }.flatten
 
-  private[this] def manualCommitSync(request: Request.ManualCommitSync[F]): F[Unit] = {
-    val commit = withConsumer.blocking(_.commitSync(request.offsets.asJava))
-    commit.attempt >>= request.callback
-  }
+  private[this] def manualCommitSync(request: Request.ManualCommitSync[F]): F[Unit] =
+    withConsumer.blocking(_.commitSync(request.offsets.asJava)).attempt >>= request.callback
 
   private[this] def runCommitAsync(
     offsets: Map[TopicPartition, OffsetAndMetadata]
@@ -255,29 +195,34 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
       .updateAndGet(_.withRebalancing(false))
       .flatMap { state =>
         log(AssignedPartitions(assigned, state)) >>
-          state.onRebalances.foldLeft(F.unit)(_ >> _.onAssigned(assigned))
+          state.onRebalances.traverse(_.onAssigned(assigned)).void
       }
 
   private[this] def revoked(revoked: SortedSet[TopicPartition]): F[Unit] = {
-    def withState[A] = StateT.apply[Id, State[F, K, V], A](_)
+    def withState[A](f: (State[F, K, V] => (State[F, K, V], A))): StateT[Id, State[F, K, V], A] =
+      StateT[Id, State[F, K, V], A](f)
 
-    def completeWithRecords(withRecords: Set[TopicPartition]) = withState { st =>
-      if (withRecords.nonEmpty) {
-        val newState = st.withoutFetchesAndRecords(withRecords)
+    def completeWithRecords(withRecords: Set[TopicPartition]): StateT[Id, State[F, K, V], F[Unit]] =
+      withState { st =>
+        if (withRecords.nonEmpty) {
+          val newState = st.withoutFetchesAndRecords(withRecords)
 
-        val action = st.fetches.filterKeysStrictList(withRecords).traverse {
-          case (partition, partitionFetches) =>
-            val records = Chunk.vector(st.records(partition).toVector)
-            partitionFetches.values.toList.traverse(_.completeRevoked(records))
-        } >> logging.log(
-          RevokedFetchesWithRecords(st.records.filterKeysStrict(withRecords), newState)
-        )
+          val action = st.fetches.filterKeysStrictList(withRecords).traverse {
+            case (partition, partitionFetches) =>
+              val records = Chunk.vector(st.records(partition).toVector)
+              partitionFetches.values.toList.traverse(_.completeRevoked(records))
+          } >>
+            logging.log(
+              RevokedFetchesWithRecords(st.records.filterKeysStrict(withRecords), newState)
+            )
 
-        (newState, action)
-      } else (st, F.unit)
-    }
+          (newState, action)
+        } else (st, F.unit)
+      }
 
-    def completeWithoutRecords(withoutRecords: SortedSet[TopicPartition]) = withState { st =>
+    def completeWithoutRecords(
+      withoutRecords: SortedSet[TopicPartition]
+    ): StateT[Id, State[F, K, V], F[Unit]] = withState { st =>
       if (withoutRecords.nonEmpty) {
         val newState = st.withoutFetches(withoutRecords)
 
@@ -290,7 +235,9 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
       } else (st, F.unit)
     }
 
-    def removeRevokedRecords(revokedNonFetches: SortedSet[TopicPartition]) = withState { st =>
+    def removeRevokedRecords(
+      revokedNonFetches: SortedSet[TopicPartition]
+    ): StateT[Id, State[F, K, V], F[Unit]] = withState { st =>
       if (revokedNonFetches.nonEmpty) {
         val revokedRecords = st.records.filterKeysStrict(revokedNonFetches)
 
@@ -330,14 +277,11 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
         )).run(withRebalancing)
       }
       .flatMap { res =>
-        val onRevoked =
-          res.onRebalances.foldLeft(F.unit)(_ >> _.onRevoked(revoked))
-
         res.logRevoked >>
           res.completeWithRecords >>
           res.completeWithoutRecords >>
           res.removeRevokedRecords >>
-          onRevoked
+          res.onRebalances.traverse(_.onRevoked(revoked)).void
       }
   }
 
@@ -345,7 +289,7 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
     callback: Either[Throwable, SortedSet[TopicPartition]] => F[Unit],
     onRebalance: Option[OnRebalance[F]]
   ): F[Unit] = {
-    def resolveDeferred(subscribed: Boolean): F[Unit] = {
+    def completeCallback(subscribed: Boolean): F[Unit] = {
       val result =
         if (subscribed) withConsumer.blocking(_.assignment.toSortedSet.asRight)
         else F.pure(Left(NotSubscribedException()))
@@ -356,12 +300,12 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
     onRebalance match {
       case Some(on) =>
         ref.updateAndGet(_.withOnRebalance(on).asStreaming).flatMap { newState =>
-          resolveDeferred(newState.subscribed) >> logging.log(StoredOnRebalance(on, newState))
+          completeCallback(newState.subscribed) >> logging.log(StoredOnRebalance(on, newState))
         }
 
       case None =>
         ref.updateAndGet(_.asStreaming).flatMap { newState =>
-          resolveDeferred(newState.subscribed)
+          completeCallback(newState.subscribed)
         }
     }
   }
@@ -437,7 +381,7 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
       def handleBatch(
         state: State[F, K, V],
         pendingCommits: Option[HandlePollResult.PendingCommits]
-      ) =
+      ): (State[F, K, V], HandlePollResult) =
         if (state.fetches.isEmpty) {
           if (newRecords.isEmpty) {
             (state, HandlePollResult.StateNotChanged(pendingCommits))
@@ -509,21 +453,22 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
           }
         }
 
-      def handlePendingCommits(state: State[F, K, V]) = {
+      def handlePendingCommits(
+        state: State[F, K, V]
+      ): (State[F, K, V], Option[HandlePollResult.PendingCommits]) = {
         val currentRebalancing = state.rebalancing
 
         if (initialRebalancing && !currentRebalancing && state.pendingCommits.nonEmpty) {
           val newState = state.withoutPendingCommits
-          (
-            newState,
+
+          newState ->
             Some(
               HandlePollResult.PendingCommits(
                 commits = state.pendingCommits,
                 log = CommittedPendingCommits(state.pendingCommits, newState)
               )
             )
-          )
-        } else (state, None)
+        } else state -> None
       }
 
       ref
@@ -546,10 +491,10 @@ private[kafka] final class KafkaConsumerActor[F[_], K, V](
         }
     }
     ref.get.flatMap { state =>
-      if (state.subscribed && state.streaming) {
+      F.whenA(state.subscribed && state.streaming) {
         val initialRebalancing = state.rebalancing
         pollConsumer(state).flatMap(handlePoll(_, initialRebalancing))
-      } else F.unit
+      }
     }
   }
 
@@ -618,10 +563,10 @@ private[kafka] object KafkaConsumerActor {
     callback: ((Chunk[CommittableConsumerRecord[F, K, V]], FetchCompletedReason)) => F[Unit]
   ) {
     def completeRevoked(chunk: Chunk[CommittableConsumerRecord[F, K, V]]): F[Unit] =
-      callback((chunk, FetchCompletedReason.TopicPartitionRevoked))
+      callback(chunk -> FetchCompletedReason.TopicPartitionRevoked)
 
     def completeRecords(chunk: Chunk[CommittableConsumerRecord[F, K, V]]): F[Unit] =
-      callback((chunk, FetchCompletedReason.FetchedRecords))
+      callback(chunk -> FetchCompletedReason.FetchedRecords)
 
     override def toString: String =
       "FetchRequest$" + System.identityHashCode(this)
@@ -649,8 +594,7 @@ private[kafka] object KafkaConsumerActor {
       streamId: StreamId,
       callback: ((Chunk[CommittableConsumerRecord[F, K, V]], FetchCompletedReason)) => F[Unit]
     ): (State[F, K, V], List[FetchRequest[F, K, V]]) = {
-      val newFetchRequest =
-        FetchRequest(callback)
+      val newFetchRequest = FetchRequest(callback)
 
       val oldPartitionFetches: Map[StreamId, FetchRequest[F, K, V]] =
         fetches.getOrElse(partition, Map.empty)
@@ -658,19 +602,13 @@ private[kafka] object KafkaConsumerActor {
       val newFetches: Map[TopicPartition, Map[StreamId, FetchRequest[F, K, V]]] =
         fetches.updated(partition, oldPartitionFetches.updated(streamId, newFetchRequest))
 
-      val fetchesToRevoke: List[FetchRequest[F, K, V]] =
-        oldPartitionFetches.get(streamId).toList
+      val fetchesToRevoke: List[FetchRequest[F, K, V]] = oldPartitionFetches.get(streamId).toList
 
-      (
-        copy(fetches = newFetches),
-        fetchesToRevoke
-      )
+      copy(fetches = newFetches) -> fetchesToRevoke
     }
 
     def withoutFetches(partitions: Set[TopicPartition]): State[F, K, V] =
-      copy(
-        fetches = fetches.filterKeysStrict(!partitions.contains(_))
-      )
+      copy(fetches = fetches.filterKeysStrict(!partitions.contains(_)))
 
     def withRecords(
       records: Map[TopicPartition, NonEmptyVector[CommittableConsumerRecord[F, K, V]]]

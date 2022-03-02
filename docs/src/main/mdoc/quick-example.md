@@ -41,8 +41,7 @@ object Main extends IOApp {
             }
         }
         .through(KafkaProducer.pipe(producerSettings))
-        .map(_.passthrough)
-        .through(commitBatchWithin(500, 15.seconds))
+        .commitBatchWithin(500, 15.seconds)
 
     stream.compile.drain.as(ExitCode.Success)
   }

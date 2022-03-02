@@ -8,10 +8,13 @@ package fs2.kafka
 
 import cats.syntax.show._
 import cats.Show
-import fs2.Chunk
+import cats.effect.Temporal
+import fs2.{Chunk, Stream}
 import fs2.kafka.instances._
 import fs2.kafka.internal.syntax._
 import org.apache.kafka.clients.producer.RecordMetadata
+
+import scala.concurrent.duration.FiniteDuration
 
 /**
   * [[ProducerResult]] represents the result of having produced zero
@@ -88,5 +91,12 @@ object ProducerResult {
         sep = ", ",
         end = show", ${result.passthrough})"
       )
+  }
+
+  implicit final class StreamOps[F[_]](
+    private val self: Stream[F, ProducerResult[CommittableOffset[F], _, _]]
+  ) {
+    def commitBatchWithin(n: Int, d: FiniteDuration)(implicit F: Temporal[F]): Stream[F, Unit] =
+      self.map(_.passthrough).through(fs2.kafka.commitBatchWithin(n, d))
   }
 }

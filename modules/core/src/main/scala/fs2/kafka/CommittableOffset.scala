@@ -6,12 +6,16 @@
 
 package fs2.kafka
 
+import cats.effect.Temporal
 import cats.{ApplicativeError, Eq, Show}
 import cats.instances.string._
 import cats.syntax.show._
+import fs2._
 import fs2.kafka.instances._
 import org.apache.kafka.clients.consumer.OffsetAndMetadata
 import org.apache.kafka.common.TopicPartition
+
+import scala.concurrent.duration.FiniteDuration
 
 /**
   * [[CommittableOffset]] represents an [[offsetAndMetadata]] for a
@@ -138,4 +142,9 @@ object CommittableOffset {
           l.offsetAndMetadata == r.offsetAndMetadata &&
           l.consumerGroupId == r.consumerGroupId
     }
+
+  implicit final class StreamOps[F[_]](private val self: Stream[F, CommittableOffset[F]]) {
+    def commitBatchWithin(n: Int, d: FiniteDuration)(implicit F: Temporal[F]): Stream[F, Unit] =
+      self.through(fs2.kafka.commitBatchWithin(n, d))
+  }
 }
